@@ -14,24 +14,44 @@ export class ChiptuneJsPlayer {
 	constructor(cfg) {
 		this.config = {...defaultCfg, ...cfg}
 
-		if (this.config.context) {
+			if (this.config.context) {
 			if (!this.config.context.destination) {
-				//console.error('This is not an audio context.')
 				throw('ChiptuneJsPlayer: This is not an audio context')
 			}
 			this.context = this.config.context
 			this.destination = false
 		} else {
 			this.context = new AudioContext()
-			this.destination = this.context.destination	// output to speakers
+			this.destination = this.context.destination
 		}
-		delete this.config.context	// remove from config, just used here and after init not changeable
 
+		console.log(
+			'[AUDIO CONTEXT]',
+			'sampleRate=', this.context.sampleRate,
+			'state=', this.context.state,
+			'baseLatency=', this.context.baseLatency
+		)
+
+		delete this.config.context
+		
 		// make gainNode
 		this.gain = this.context.createGain()
 		this.gain.gain.value = 1
 
+// Audio warm-up — пробуждаем аудиотракт Android/Chrome
+const osc = this.context.createOscillator()
+const warmupGain = this.context.createGain()
+
+warmupGain.gain.value = 0
+
+osc.connect(warmupGain)
+warmupGain.connect(this.context.destination)
+
+osc.start()
+osc.stop(this.context.currentTime + 0.5)
+
 		this.handlers = []
+		this._playGen = 0 // номер текущей попытки воспроизведения (см. chiptune3.worklet.js)
 
 		// worklet
 		this.context.audioWorklet.addModule( new URL('./chiptune3.worklet.js', import.meta.url) )
@@ -44,7 +64,9 @@ export class ChiptuneJsPlayer {
 			// message port
 			this.processNode.port.onmessage = this.handleMessage_.bind(this)
 			this.processNode.port.postMessage({cmd:'config', val:this.config})
-			this.fireEvent('onInitialized')
+			// onInitialized теперь вызывается позже — см. handleMessage_,
+			// случай 'ready' (когда движок libopenmpt внутри воркера
+			// реально загрузился, а не просто создался сам узел)
 
 			// audio routing
 			this.processNode.connect(this.gain)
@@ -56,13 +78,19 @@ export class ChiptuneJsPlayer {
 	// msg from worklet
 	handleMessage_(msg) {
 		switch (msg.data.cmd) {
+			case 'ready':
+				this.fireEvent('onInitialized')
+				break
 			case 'meta':
+				if (msg.data.gen !== this._playGen) break // "хвост" от уже сброшенного трека
 				this.meta = msg.data.meta
 				this.duration = msg.data.meta.dur
 				this.fireEvent('onMetadata', this.meta)
 				break
 			case 'pos':
+				if (msg.data.gen !== this._playGen) break // "хвост" от уже сброшенного трека
 				//this.meta.pos = msg.data.pos
+	
 				this.currentTime = msg.data.pos
 				this.order = msg.data.order
 				this.pattern = msg.data.pattern
@@ -70,9 +98,11 @@ export class ChiptuneJsPlayer {
 				this.fireEvent('onProgress', msg.data)
 				break
 			case 'end':
+				if (msg.data.gen !== this._playGen) break // "хвост" от уже сброшенного трека — игнорируем
 				this.fireEvent('onEnded')
 				break
 			case 'err':
+				if (msg.data.gen !== this._playGen) break // то же самое для ошибок
 				this.fireEvent('onError', {type: msg.data.val})
 				break
 			case 'fullAudioData':
@@ -113,7 +143,18 @@ export class ChiptuneJsPlayer {
 		.then(arrayBuffer => this.play(arrayBuffer))
 		.catch(e=>{this.fireEvent('onError', {type: 'Load'})})
 	}
-	play(val) { this.postMsg('play', val) }
+	play(val) {
+	this._playGen = (this._playGen || 0) + 1
+
+	console.log(
+		'[PLAY]',
+		'sampleRate=', this.context.sampleRate,
+		'state=', this.context.state,
+		'currentTime=', this.context.currentTime
+	)
+
+	this.postMsg('play', { buffer: val, gen: this._playGen })
+}
 	stop() { this.postMsg('stop') }
 	pause() { this.postMsg('pause') }
 	unpause() { this.postMsg('unpause') }
